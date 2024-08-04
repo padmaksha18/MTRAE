@@ -92,9 +92,6 @@ class customLoss(nn.Module):
         dist = -2 * torch.mm(x, x.t()) + instances_norm + instances_norm.t()
         return torch.exp(-dist / sigma)
 
-    #def calculate_correlation_mat(self,Z_x, Z_cd):
-
-
     def renyi_entropy(self, code, sigma):  # code is batch * latent dim
         # calculate entropy for single variables x (Eq.(9) in paper)
         #         Args:
