@@ -1,0 +1,217 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from data_preprocess_coral import Dataset
+
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+epochs = 200
+batch_size = 200
+#feats = 19
+#domains = 10
+classes = 2
+latent_dims = 8
+learning_rate = 0.005
+
+
+criterion = nn.MSELoss()
+
+class MultitaskAutoencoder(nn.Module):
+    def __init__(self, D_in, H = 25,H2 = 20 ,latent_dim=11):
+        # Encoder
+        super(MultitaskAutoencoder, self).__init__()
+        self.linear1 = nn.Linear(D_in, H)  # 29 * 20
+        self.lin_bn1 = nn.BatchNorm1d(num_features=H)
+        self.linear2 = nn.Linear(H, H2)  # 20 * 10
+        self.lin_bn2 = nn.BatchNorm1d(num_features=H2)
+        self.linear3 = nn.Linear(H2, H2)  # 10 * 10
+        self.lin_bn3 = nn.BatchNorm1d(num_features=H2)
+        self.num_class = classes
+
+        self.fc1 = nn.Linear(H2, latent_dim)  # 10 * 7
+
+        self.classifier = nn.Linear(latent_dim, self.num_class)  # 7 * 3
+
+        # classifier
+        # self.classifier = nn.Linear(latent_dim, self.num_class) # 7 * 3
+
+        #         # Decoder
+        self.fc3 = nn.Linear(latent_dim, latent_dim)  # 7 * 7
+        #         self.fc_bn3 = nn.BatchNorm1d(latent_dim)
+        self.fc4 = nn.Linear(latent_dim, H2)  # 7 * 10
+        #         self.fc_bn4 = nn.BatchNorm1d(H2)
+
+        self.linear4 = nn.Linear(H2, H2)  # 10 * 10
+        self.lin_bn4 = nn.BatchNorm1d(num_features=H2)
+        self.linear5 = nn.Linear(H2, H)  # 10 * 20
+        self.lin_bn5 = nn.BatchNorm1d(num_features=H)
+        self.linear6 = nn.Linear(H, D_in)  # 20 * 29
+        self.lin_bn6 = nn.BatchNorm1d(num_features=D_in)
+        self.relu = nn.ReLU()
+
+    def encode(self, x):
+        lin1 = self.relu(self.lin_bn1(self.linear1(x)))  # 29 * 20
+        lin2 = self.relu(self.lin_bn2(self.linear2(lin1)))  # 20 * 10
+        lin3 = self.relu(self.lin_bn3(self.linear3(lin2)))  # 10 * 10
+
+        fc1 = self.relu(self.fc1(lin3))  # 10 * 7
+        # fc2 = F.relu(self.classifier(fc1)) # 7 * 3
+        return fc1
+
+    def decode(self, z):
+        fc3 = self.relu(self.fc3(z))  # 7 * 7
+        fc4 = self.relu(self.fc4(fc3))  # .view(128, -1) # 7 * 10
+
+        lin4 = self.relu(self.lin_bn4(self.linear4(fc4)))  # 10 * 10
+        lin5 = self.relu(self.lin_bn5(self.linear5(lin4)))  # 10 * 20
+
+        return self.lin_bn6(self.linear6(lin5))  # 20 * 29
+
+    def forward(self, inputs):  #batch * feats
+        z = self.encode(inputs)  # 29 * 3
+        logits = self.classifier(z)
+        reconstruction = self.decode(z)
+        return logits, reconstruction, z
+
+
+class customLoss(nn.Module):
+    def __init__(self):
+        super(customLoss, self).__init__()
+        self.mse_loss = nn.MSELoss()  #(reduction="sum")
+        self.classification_criterion = nn.CrossEntropyLoss()
+
+    def calc_covariance(self, X):
+
+        # Example: Generating a random data matrix with 100 samples and 5 features
+        N = X.shape[0]
+
+        # Calculate the mean of each feature
+        mean_vector = torch.mean(X, dim=0)
+
+        # Center the data by subtracting the mean
+        centered_data = X - mean_vector
+
+        # Calculate the covariance matrix
+        covariance_matrix = torch.mm(centered_data.t(), centered_data) / (N - 1)
+
+        return (covariance_matrix)
+
+    def coral_loss(self, Z_x, Z_cross_dom ):
+        """
+        Arguments:
+            x: features from one domain
+            y: features from the other domain
+        """
+
+        cx = self.calc_covariance(Z_x)
+        cy = self.calc_covariance(Z_cross_dom)
+
+        frobenius_norm = torch.norm(cx - cy, 'fro')
+        # Calculate the product of Frobenius norms of each matrix
+        product_frobenius_norms = torch.norm(cx, 'fro') * torch.norm(cy, 'fro')
+        # Calculate the normalized Frobenius norm
+        normalized_frobenius_norm = frobenius_norm / product_frobenius_norms
+        return normalized_frobenius_norm
+
+
+    def forward(self, X_train, dec_out, Z_x, X_cross_dom, Z_cross_dom, logits, targets):
+    #def forward(self, X_train, dec_out, Z_x, X_cross_dom, logits, targets):
+
+
+        loss_MSE = self.mse_loss(dec_out, X_train)
+        #print ("MSE:", loss_MSE)
+
+        targets = torch.flatten(targets)
+        # print ("TARGETS:",targets)
+
+        classification_loss = self.classification_criterion(logits, targets)
+        #print("CLASSIFICATION LOSS:", classification_loss)
+
+        coral_loss = self.coral_loss(Z_x, Z_cross_dom)
+        #print("CORAL LOSS:", coral_loss)
+
+        #entropy_loss = self.entropy_loss(X_train, Z_x, True)
+
+        total_loss =  classification_loss + (0.6 * loss_MSE)  + ( 0.5 * coral_loss)
+
+        return total_loss
+
+
+#D_in = data_set.x.shape[1]
+D_in = 19
+print ("D_in shape:", D_in)
+H = 13
+H2 = 8
+
+log_interval = 150
+val_losses = []
+train_losses = []
+
+multitaskAE = MultitaskAutoencoder(D_in, H, H2).to(device)
+optimizer = torch.optim.Adam(multitaskAE.parameters(), lr=learning_rate, weight_decay= 1e-5 )
+
+
+def train_AE():
+
+    for epoch in range(epochs):
+            train_loss = 0
+            losses = []
+
+            dataset = Dataset(dom=0)
+            dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+            #for X_train, X_cross_dom, targets in dataloader:
+            for X_train, X_cross_dom, targets in dataloader:
+                # data = data.to(device)
+
+                X_train = X_train.float().to(device)
+                #print ("INPUTS SHAPE:", input.shape)
+
+                X_cross_dom = X_cross_dom.float().to(device) # ground truth feature data
+                #print("X_cross_dom SHAPE:", X_cross_dom.shape)
+
+                targets = targets.long().to(device)
+                #print ("TARGETS IN TRAIN:", targets)
+
+                optimizer.zero_grad()
+
+                logits, dec_out, Z_x = multitaskAE(X_train) ## model
+                # print ("logits train:", logits)
+
+                # For CROSS-DOM DATA
+                logits_z, dec_out_z, Z_cross_dom = multitaskAE(X_cross_dom)  ## model
+
+                total_loss  = customLoss()
+
+                loss = total_loss(X_train, dec_out, Z_x, X_cross_dom, Z_cross_dom, logits, targets)
+
+                #loss = total_loss(X_train, dec_out, Z_x, X_cross_dom, logits, targets)
+
+                losses.append(loss)
+
+            final_loss = torch.mean(torch.stack(losses))
+            #print("FINAL LOSS:", final_loss)
+
+            final_loss.backward()
+            train_loss += final_loss.item()
+            optimizer.step()
+
+            if epochs % 50 == 0:
+                print('====> Epoch: {} Average loss: {:.4f}'.format(
+                    epochs, train_loss)) # / len(dataloader.dataset)))
+                train_losses.append(train_loss )#/ len(dataloader.dataset))
+
+
+train_AE()
+PATH = "/content/gdrive/My Drive/MTL-RED/MODELS/ARRYTHMIA/CORAL/CORAL_REC_06_MI_2_BATCH_200_NORM_VEB_16K.pth"
+torch.save(multitaskAE, PATH)
+torch.save(multitaskAE.state_dict(), PATH)
+print("MODEL SAVED")
+
+# print("PLOTTING TRAINING:")
+# X = np.arange(epochs)
+# Y = train_losses
+# plt.plot(X, Y)
+# plt.savefig('loss_vs_epoch.png')
+
